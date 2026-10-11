@@ -1,9 +1,9 @@
 diff --git a/ipc/glue/NSExtensionUtils.mm b/ipc/glue/NSExtensionUtils.mm
 new file mode 100644
-index 000000000000..518377a5f5dd
+index 000000000000..7e85050e55e3
 --- /dev/null
 +++ b/ipc/glue/NSExtensionUtils.mm
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,466 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -15,6 +15,7 @@ index 000000000000..518377a5f5dd
 +#include "LaunchError.h"
 +
 +#import <Foundation/Foundation.h>
++#include <dlfcn.h>
 +#include <memory>
 +
 +#import "mozilla/widget/GeckoViewSupport.h"
@@ -29,9 +30,15 @@ index 000000000000..518377a5f5dd
 +- (nullable NSUUID*)
 +    beginExtensionRequestWithInputItems:(NSArray<NSExtensionItem*>*)items
 +                                  error:(NSError* _Nullable*)error;
++- (void)beginExtensionRequestWithInputItems:(NSArray<NSExtensionItem*>*)items
++                                 completion:
++                                     (void (^)(NSUUID* _Nullable))callback;
 +- (void)cancelExtensionRequestWithIdentifier:(NSUUID*)requestIdentifier;
 +- (void)setRequestInterruptionBlock:
 +    (void (^_Nonnull)(NSUUID* requestIdentifier))block;
++- (void)setRequestCancellationBlock:
++    (void (^_Nonnull)(NSUUID* requestIdentifier, NSError* error))block;
++@property(nonatomic, copy) NSArray* preferredLanguages;
 +@end
 +
 +@interface NSXPCConnection (Private)
@@ -99,15 +106,73 @@ index 000000000000..518377a5f5dd
 +  return [NSError errorWithDomain:@"ReynardExtension" code:1 userInfo:userInfo];
 +}
 +
-+static NSString* _Nullable GetExtensionIdentifier() {
-+  NSURL* plugInsURL = [[NSBundle mainBundle] builtInPlugInsURL];
-+  if (!plugInsURL) {
++// When running inside LiveContainer, the guest binary is dlopen'ed by the host,
++// so [NSBundle mainBundle] is LiveContainer's bundle. Locate our own .app by
++// walking up from this image's path on disk instead.
++static NSURL* _Nullable FindOwnAppBundleURL() {
++  Dl_info info = {};
++  if (!dladdr((void*)FindOwnAppBundleURL, &info) || !info.dli_fname) {
 +    return nil;
 +  }
++  NSURL* url = [NSURL fileURLWithPath:@(info.dli_fname)];
++  for (int i = 0; i < 4 && url; i++) {
++    url = url.URLByDeletingLastPathComponent;
++    if (!url) {
++      break;
++    }
++    if ([url.pathExtension isEqualToString:@"app"]) {
++      return url;
++    }
++  }
++  return nil;
++}
 +
-+  NSURL* extensionURL =
-+      [plugInsURL URLByAppendingPathComponent:@"Reynard Helper.appex"];
++static NSURL* _Nullable GetOwnExtensionURL() {
++  NSURL* appURL = FindOwnAppBundleURL();
++  if (!appURL) {
++    appURL = [[NSBundle mainBundle] bundleURL];
++  }
++  return [appURL URLByAppendingPathComponent:@"PlugIns/Reynard Helper.appex"];
++}
++
++static NSString* _Nullable GetExtensionIdentifier() {
++  NSURL* extensionURL = GetOwnExtensionURL();
 +  return [[NSBundle bundleWithURL:extensionURL] bundleIdentifier];
++}
++
++// LiveContainer hosts guest apps' App Extensions through its LiveProcess.appex
++// (see LiveProcess/main.m in the LiveContainer fork). Detect it in the host
++// bundle's PlugIns; absent when running as a normally installed app.
++static NSString* _Nullable GetLiveProcessExtensionIdentifier() {
++  NSURL* pluginsURL = [[NSBundle mainBundle] builtInPlugInsURL];
++  if (!pluginsURL) {
++    return nil;
++  }
++  NSBundle* liveProcessBundle = [NSBundle bundleWithURL:
++      [pluginsURL URLByAppendingPathComponent:@"LiveProcess.appex"]];
++  if (!liveProcessBundle) {
++    return nil;
++  }
++  return liveProcessBundle.bundleIdentifier;
++}
++
++static NSData* _Nullable CreateAppDirectoryBookmark(NSURL* extensionURL) {
++  // PlugIns/<name>.appex -> containing .app
++  NSURL* appURL =
++      extensionURL.URLByDeletingLastPathComponent.URLByDeletingLastPathComponent;
++  if (!appURL) {
++    return nil;
++  }
++  NSError* error = nil;
++  // 1 << 11 matches LiveContainer's security-scoped bookmark creation
++  NSData* data = [appURL bookmarkDataWithOptions:(1 << 11)
++                    includingResourceValuesForKeys:nil
++                                     relativeToURL:nil
++                                             error:&error];
++  if (error) {
++    NSLog(@"Reynard: app dir bookmark creation failed: %@", error);
++  }
++  return data;
 +}
 +
 +@interface ExtensionProcess : NSObject {
@@ -192,16 +257,50 @@ index 000000000000..518377a5f5dd
 +    [mListener setDelegate:mListenerDelegate];
 +    [mListener resume];
 +
-+    NSString* extensionIdentifier = GetExtensionIdentifier();
-+    if (!extensionIdentifier) {
-+      completeOnce(ExtensionLaunchError(
-+          @"Unable to resolve extension bundle identifier"));
-+      return;
++    // The item handed to the child process: it carries our anonymous listener
++    // endpoint, which the child connects back to during bootstrap.
++    NSExtensionItem* childItem = [[[NSExtensionItem alloc] init] autorelease];
++    [childItem setUserInfo:@{@"ReynardXPCListenerEndpoint" : [mListener endpoint]}];
++
++    NSExtensionItem* hostItem = childItem;
++    NSError* extensionError = nil;
++
++    NSURL* ownExtensionURL = GetOwnExtensionURL();
++    NSString* liveProcessIdentifier = GetLiveProcessExtensionIdentifier();
++    if (liveProcessIdentifier && ownExtensionURL) {
++      // LiveContainer mode: the child extension is not registered with the
++      // system, so ask LiveContainer's LiveProcess.appex to host it. The
++      // endpoint is forwarded to the child inside lcGuestExtensionInputItems.
++      NSExtensionItem* containerItem =
++          [[[NSExtensionItem alloc] init] autorelease];
++      NSMutableDictionary* containerUserInfo = [NSMutableDictionary dictionary];
++      containerUserInfo[@"lcGuestExtensionPath"] = ownExtensionURL.path;
++      containerUserInfo[@"lcGuestExtensionInputItems"] = @[ childItem ];
++      NSString* principalClass = [[[NSBundle bundleWithURL:ownExtensionURL]
++          infoDictionary][@"NSExtension"] objectForKey:@"NSExtensionPrincipalClass"];
++      if (principalClass) {
++        containerUserInfo[@"lcGuestExtensionPrincipalClass"] = principalClass;
++      }
++      NSData* bookmark = CreateAppDirectoryBookmark(ownExtensionURL);
++      if (bookmark) {
++        containerUserInfo[@"bookmarks"] = @[ bookmark ];
++      }
++      [containerItem setUserInfo:containerUserInfo];
++      hostItem = containerItem;
++
++      mExtension = [[NSExtension extensionWithIdentifier:liveProcessIdentifier
++                                                   error:&extensionError] retain];
++    } else {
++      NSString* extensionIdentifier = GetExtensionIdentifier();
++      if (!extensionIdentifier) {
++        completeOnce(ExtensionLaunchError(
++            @"Unable to resolve extension bundle identifier"));
++        return;
++      }
++      mExtension = [[NSExtension extensionWithIdentifier:extensionIdentifier
++                                                   error:&extensionError] retain];
 +    }
 +
-+    NSError* extensionError = nil;
-+    mExtension = [[NSExtension extensionWithIdentifier:extensionIdentifier
-+                                                 error:&extensionError] retain];
 +    if (!mExtension) {
 +      completeOnce(ExtensionLaunchError(@"Failed to create NSExtension",
 +                                        extensionError));
@@ -212,22 +311,33 @@ index 000000000000..518377a5f5dd
 +      completeOnce(ExtensionLaunchError(
 +          @"NSExtension request interrupted before bootstrap"));
 +    }];
++    [mExtension setRequestCancellationBlock:^(NSUUID* requestIdentifier,
++                                              NSError* error) {
++      completeOnce(ExtensionLaunchError(
++          @"NSExtension request cancelled before bootstrap", error));
++    }];
 +
-+    NSExtensionItem* input = [[[NSExtensionItem alloc] init] autorelease];
-+    [input setUserInfo:@{@"ReynardXPCListenerEndpoint" : [mListener endpoint]}];
-+
-+    NSError* requestError = nil;
-+    mRequestIdentifier =
-+        [[mExtension beginExtensionRequestWithInputItems:@[ input ]
-+                                                   error:&requestError] retain];
-+    if (!mRequestIdentifier) {
-+      completeOnce(ExtensionLaunchError(@"Failed to start NSExtension request",
-+                                        requestError));
++    __block NSUUID* requestIdentifier = nil;
++    __block bool requestReturned = false;
++    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
++    [mExtension beginExtensionRequestWithInputItems:@[ hostItem ]
++                                         completion:^(NSUUID* identifier) {
++                                           requestIdentifier = [identifier copy];
++                                           requestReturned = true;
++                                           dispatch_semaphore_signal(semaphore);
++                                         }];
++    // Nested launches (LiveContainer inside the loop) can take a while
++    dispatch_semaphore_wait(semaphore,
++                            dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
++    if (!requestReturned || !requestIdentifier) {
++      completeOnce(ExtensionLaunchError(
++          @"Failed to start NSExtension request"));
 +      return;
 +    }
++    mRequestIdentifier = [requestIdentifier retain];
 +
 +    dispatch_after(
-+        dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
++        dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC),
 +        ExtensionLaunchQueue(), ^{
 +          completeOnce(ExtensionLaunchError(
 +              @"Timed out waiting for child extension NSXPC connection"));
