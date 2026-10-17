@@ -3,7 +3,7 @@ new file mode 100644
 index 000000000000..7e85050e55e3
 --- /dev/null
 +++ b/ipc/glue/NSExtensionUtils.mm
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,476 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -16,6 +16,7 @@ index 000000000000..7e85050e55e3
 +
 +#import <Foundation/Foundation.h>
 +#include <dlfcn.h>
++#include <objc/message.h>
 +#include <memory>
 +
 +#import "mozilla/widget/GeckoViewSupport.h"
@@ -106,9 +107,9 @@ index 000000000000..7e85050e55e3
 +  return [NSError errorWithDomain:@"ReynardExtension" code:1 userInfo:userInfo];
 +}
 +
-+// When running inside LiveContainer, the guest binary is dlopen'ed by the host,
-+// so [NSBundle mainBundle] is LiveContainer's bundle. Locate our own .app by
-+// walking up from this image's path on disk instead.
++// When running inside LiveContainer, the guest binary is dlopen'ed by the host
++// (and LiveProcess may load this code from the extension). Locate our own .app
++// by walking up from this image's path on disk.
 +static NSURL* _Nullable FindOwnAppBundleURL() {
 +  Dl_info info = {};
 +  if (!dladdr((void*)FindOwnAppBundleURL, &info) || !info.dli_fname) {
@@ -143,8 +144,17 @@ index 000000000000..7e85050e55e3
 +// LiveContainer hosts guest apps' App Extensions through its LiveProcess.appex
 +// (see LiveProcess/main.m in the LiveContainer fork). Detect it in the host
 +// bundle's PlugIns; absent when running as a normally installed app.
++// LiveContainer replaces [NSBundle mainBundle] with the guest app's bundle, so
++// its own bundle has to be taken from +[NSUserDefaults lcMainBundle].
 +static NSString* _Nullable GetLiveProcessExtensionIdentifier() {
-+  NSURL* pluginsURL = [[NSBundle mainBundle] builtInPlugInsURL];
++  SEL lcMainBundleSelector = NSSelectorFromString(@"lcMainBundle");
++  if (![NSUserDefaults respondsToSelector:lcMainBundleSelector]) {
++    return nil;
++  }
++  NSBundle* hostBundle =
++      ((NSBundle * (*)(id, SEL))objc_msgSend)([NSUserDefaults class],
++                                               lcMainBundleSelector);
++  NSURL* pluginsURL = [hostBundle builtInPlugInsURL];
 +  if (!pluginsURL) {
 +    return nil;
 +  }
